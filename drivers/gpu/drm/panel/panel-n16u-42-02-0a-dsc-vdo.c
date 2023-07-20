@@ -643,7 +643,7 @@ static struct LCM_setting_table lhbm_normal_white_250nit[] = {
 	{0x6F, 01, {0x80}},
 	{0xB8, 03, {0x00,0x10,0x00}},
 
-	//FPR ON	
+	//FPR ON
 	{0xF0, 05, {0x55, 0xAA, 0x52, 0x08, 0x02}},
 	{0xD1, 06, {0x1B,0xB4,0x19,0x8F,0x20,0x53}},
 
@@ -700,9 +700,9 @@ static struct LCM_setting_table lhbm_off[] = {
 	{0xB8, 16, {0x9B,0x18,0x9E,0x18,0x9E,0x16,0x27,0x16,0x27,0x14,0xFC,0x14,0xFC,0x10,0x00,0x10}},
 	{0x6F, 01, {0x80}},
 	{0xB8, 03, {0x00,0x10,0x00}},
-	
+
 	//FPR OFF
-	//FPR_ALPHA_EN = 1, FPR_AUTO_ON = 1, FPR_ENABLE_CMD = 1	
+	//FPR_ALPHA_EN = 1, FPR_AUTO_ON = 1, FPR_ENABLE_CMD = 1
 	{0xA9, 12, {0x02,0x00,0xB5,0x2C,0x2C,0x03,0x01,0x00,0x87,0x00,0x00,0x20}},
 	//restore change gray level by temperature
 	{0x57, 01, {0x00}},
@@ -1018,6 +1018,7 @@ static int lcm_enable(struct drm_panel *panel)
 	return 0;
 }
 
+#ifdef ENABLE_30HZ
 static const struct drm_display_mode mode_30hz = {
 	.clock = 246629,
 	.hdisplay = 1220,
@@ -1029,6 +1030,7 @@ static const struct drm_display_mode mode_30hz = {
 	.vsync_end = 2712 + 45 + 2,		//VSA
 	.vtotal = 2712 + 45 + 2 + 9,		//VBP
 };
+#endif
 
 static const struct drm_display_mode mode_60hz = {
 	.clock = 425165,
@@ -1067,6 +1069,7 @@ static const struct drm_display_mode mode_120hz = {
 };
 
 #if defined(CONFIG_MTK_PANEL_EXT)
+#ifdef ENABLE_30HZ
 static struct mtk_panel_params ext_params_30hz = {
 	.lcm_index = 0,
 	.pll_clk = DATA_RATE / 2,
@@ -1134,6 +1137,7 @@ static struct mtk_panel_params ext_params_30hz = {
 	.physical_width_um = PHYSICAL_WIDTH,
 	.physical_height_um = PHYSICAL_HEIGHT,
 };
+#endif
 
 static struct mtk_panel_params ext_params_60hz = {
 	.lcm_index = 0,
@@ -1361,9 +1365,12 @@ static int mtk_panel_ext_param_get(struct drm_panel *panel,
 
 	dst_fps = m_dst ? drm_mode_vrefresh(m_dst) : -EINVAL;
 
+#ifdef ENABLE_30HZ
 	if (dst_fps == 30)
 		*ext_param = &ext_params_30hz;
-	else if (dst_fps == 60)
+	else
+#endif
+		if (dst_fps == 60)
 		*ext_param = &ext_params_60hz;
 	else if (dst_fps == 90)
 		*ext_param = &ext_params_90hz;
@@ -1393,6 +1400,7 @@ static int mtk_panel_ext_param_set(struct drm_panel *panel,
 
 	globle_mtk_dsi->mi_cfg.dynamic_fps = dst_fps;
 
+#ifdef ENABLE_30HZ
 	if (dst_fps == 30) {
 		if (panel_ctx->doze_brightness_state == DOZE_BRIGHTNESS_HBM) {
 			ext_params_30hz.dyn_fps.dfps_cmd_table[1].para_list[1] = (doze_hbm_dbv_level >>8) & 0xFF;
@@ -1406,7 +1414,9 @@ static int mtk_panel_ext_param_set(struct drm_panel *panel,
 			ext_params_30hz.dyn_fps.dfps_cmd_table[1].para_list[6] = 0x55;
 		}
 		ext->params = &ext_params_30hz;
-	} else if (dst_fps == 60) {
+	} else
+#endif
+		if (dst_fps == 60) {
 		ext->params = &ext_params_60hz;
 	} else if (dst_fps == 90) {
 		ext->params = &ext_params_90hz;
@@ -2487,9 +2497,14 @@ struct panel_desc {
 
 static int lcm_get_modes(struct drm_panel *panel, struct drm_connector *connector)
 {
+#ifdef ENABLE_30HZ
+	struct drm_display_mode *mode_30;
+#endif
+	struct drm_display_mode *mode_60;
+	struct drm_display_mode *mode_90;
+	struct drm_display_mode *mode_120;
 
-	struct drm_display_mode *mode_30, *mode_60, *mode_90, *mode_120;
-
+#ifdef ENABLE_30HZ
 	mode_30 = drm_mode_duplicate(connector->dev, &mode_30hz);
 	if (!mode_30) {
 		dev_err(connector->dev->dev, "failed to add mode %ux%ux@%u\n",
@@ -2500,6 +2515,7 @@ static int lcm_get_modes(struct drm_panel *panel, struct drm_connector *connecto
 	drm_mode_set_name(mode_30);
 	mode_30->type = DRM_MODE_TYPE_DRIVER;
 	drm_mode_probed_add(connector, mode_30);
+#endif
 
 	mode_60 = drm_mode_duplicate(connector->dev, &mode_60hz);
 	if (!mode_60) {
@@ -2639,10 +2655,13 @@ static int lcm_probe(struct mipi_dsi_device *dsi)
 	ctx->factory_max_brightness = FACTORY_MAX_BRIGHTNESS;
 
 	ext_params_60hz.err_flag_irq_gpio = of_get_named_gpio_flags(
-		dev->of_node, "mi,esd-err-irq-gpio",
-		0, (enum of_gpio_flags *)&(ext_params_60hz.err_flag_irq_flags));
+		dev->of_node, "mi,esd-err-irq-gpio", 0,
+		(enum of_gpio_flags *)&(ext_params_60hz.err_flag_irq_flags));
+
+#ifdef ENABLE_30HZ
 	ext_params_30hz.err_flag_irq_gpio = ext_params_60hz.err_flag_irq_gpio;
 	ext_params_30hz.err_flag_irq_flags = ext_params_60hz.err_flag_irq_flags;
+#endif
 	ext_params_90hz.err_flag_irq_gpio = ext_params_60hz.err_flag_irq_gpio;
 	ext_params_90hz.err_flag_irq_flags = ext_params_60hz.err_flag_irq_flags;
 	ext_params_120hz.err_flag_irq_gpio = ext_params_60hz.err_flag_irq_gpio;
