@@ -130,7 +130,7 @@ static int ln8410_set_adc_mode(struct ln8410_device *chip, u8 mode)
 	int ret = 0;
 
 	if (mode == 0x00) {
-		/* adc one-shot mode disable all channel */ 
+		/* adc one-shot mode disable all channel */
 		/* the channel will be enable when request read adc */
 		ret = regmap_write(chip->regmap, LN8410_REG_14, 0x49);
 		ret = regmap_write(chip->regmap, LN8410_REG_ADC_FN_DISABLE1, 0xFF);
@@ -171,8 +171,7 @@ static int ln8410_enable_qb(struct ln8410_device *chip, bool enable)
 	return ret;
 }
 
-
-static ln8410_set_infet_shdn_cfg(struct ln8410_device *chip, bool enable)
+static int ln8410_set_infet_shdn_cfg(struct ln8410_device *chip, bool enable)
 {
 	int ret = 0;;
 
@@ -185,7 +184,7 @@ static ln8410_set_infet_shdn_cfg(struct ln8410_device *chip, bool enable)
 	return ret;
 }
 
-static  ln8410_set_bst_live_mask(struct ln8410_device * chip, bool enable)
+static int ln8410_set_bst_live_mask(struct ln8410_device *chip, bool enable)
 {
 	int ret;
 
@@ -1786,4 +1785,3 @@ module_i2c_driver(ln8410_driver);
 MODULE_AUTHOR("xiezhichang <xiezhichang@xiaomi.com>");
 MODULE_DESCRIPTION("ln8410 charger pump driver");
 MODULE_LICENSE("GPL v2");
-
