@@ -44,7 +44,7 @@ CFLAGS += -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE
 
 CFLAGS += -I$(srctree)/tools/include/
 
-CFLAGS += $(EXTRA_WARNINGS) $(EXTRA_CFLAGS)
+CFLAGS += $(EXTRA_WARNINGS) $(EXTRA_CFLAGS) -include $(srctree)/tools/include/isoc23.h
 
 SUBCMD_IN := $(OUTPUT)libsubcmd-in.o
 
