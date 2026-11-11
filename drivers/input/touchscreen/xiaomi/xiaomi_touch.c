@@ -1169,6 +1169,34 @@ static DEVICE_ATTR(fod_press_status, (0664), fod_press_status_show, NULL);
 
 static DEVICE_ATTR(gesture_single_tap_state, (0664), gesture_single_tap_value_show, NULL);
 
+static int fod_longpress_gesture_enabled;
+
+static ssize_t fod_longpress_gesture_enabled_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "%d\n", fod_longpress_gesture_enabled);
+}
+
+static ssize_t fod_longpress_gesture_enabled_store(struct device *dev,
+		struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct xiaomi_touch_pdata *pdata = dev_get_drvdata(dev);
+	unsigned int input;
+
+	if (kstrtouint(buf, 10, &input) || input > 1)
+		return -EINVAL;
+
+	if (!pdata || !pdata->touch_data[0] || !pdata->touch_data[0]->setModeValue)
+		return -ENODEV;
+
+	pdata->touch_data[0]->setModeValue(Touch_Fod_Enable, input);
+	fod_longpress_gesture_enabled = input;
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(fod_longpress_gesture_enabled);
+
 static struct attribute *touch_attr_group[] = {
 	&dev_attr_enable_touch_raw.attr,
 	&dev_attr_enable_touch_delta.attr,
@@ -1196,6 +1224,7 @@ static struct attribute *touch_attr_group[] = {
 	&dev_attr_suspend_state.attr,
 	&dev_attr_fod_press_status.attr,
 	&dev_attr_gesture_single_tap_state.attr,
+	&dev_attr_fod_longpress_gesture_enabled.attr,
 	NULL,
 };
 
