@@ -740,35 +740,29 @@ static int battery_psy_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
 		val->intval = check_cap_level(bs_data->bat_capacity);
 		break;
-	case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
-		ret = check_cap_level(bs_data->bat_capacity);
-		if ((ret == POWER_SUPPLY_CAPACITY_LEVEL_FULL) ||
-			(ret == POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN))
-			val->intval = 0;
-		else {
-			int q_max_now = gm->fg_table_cust_data.fg_profile[
-						gm->battery_id].q_max;
-			int remain_ui = 100 - bs_data->bat_capacity;
-			int remain_mah = remain_ui * q_max_now / 10;
-			int current_now = 0;
-			int time_to_full = 0;
+	case POWER_SUPPLY_PROP_TIME_TO_FULL_NOW: {
+		union power_supply_propval cap = {0}, full = {0}, cur = {0};
+		s64 remain_uah, cur_ua;
 
-			ret = gauge_get_property(GAUGE_PROP_BATTERY_CURRENT,
-				&current_now);
+		val->intval = 0;
+		if (!gm->ti_bms_psy ||
+			power_supply_get_property(gm->ti_bms_psy,
+				POWER_SUPPLY_PROP_CAPACITY, &cap) ||
+			power_supply_get_property(gm->ti_bms_psy,
+				POWER_SUPPLY_PROP_CHARGE_FULL, &full) ||
+			power_supply_get_property(gm->ti_bms_psy,
+				POWER_SUPPLY_PROP_CURRENT_NOW, &cur))
+			break;
 
-			if (ret == -EHOSTDOWN)
-				current_now = gm->ibat;
+		cur_ua = abs(cur.intval);
+		if (cap.intval >= 100 || full.intval <= 0 || cur_ua < 1000)
+			break;
 
-			if (current_now != 0)
-				time_to_full = remain_mah * 3600 / current_now;
-
-				bm_debug("time_to_full:%d, remain:ui:%d mah:%d, current_now:%d, qmax:%d\n",
-					time_to_full, remain_ui, remain_mah,
-					current_now, q_max_now);
-			val->intval = abs(time_to_full);
-		}
-		ret = 0;
+		remain_uah = (s64)(100 - cap.intval) * full.intval / 100;
+		val->intval = min_t(s64,
+			div_s64(remain_uah * 3600, cur_ua), 65535);
 		break;
+	}
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
 		power_supply_get_property(gm->ti_bms_psy, POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN, val);
 		break;
@@ -4160,4 +4154,3 @@ int battery_init(struct platform_device *pdev)
 
 	return 0;
 }
-
