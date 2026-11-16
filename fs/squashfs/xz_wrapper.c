@@ -57,10 +57,10 @@ static void *squashfs_xz_comp_opts(struct squashfs_sb_info *msblk,
 
 		opts->dict_size = le32_to_cpu(comp_opts->dictionary_size);
 
-		/* the dictionary size should be 2^n or 2^n+2^(n+1) */
+		/* the dictionary size should be positive and 2^n or 2^n+2^(n+1) */
 		n = ffs(opts->dict_size) - 1;
-		if (opts->dict_size != (1 << n) && opts->dict_size != (1 << n) +
-						(1 << (n + 1))) {
+		if (opts->dict_size <= 0 || (opts->dict_size != (1 << n) &&
+			opts->dict_size != (1 << n) + (1 << (n + 1)))) {
 			err = -EIO;
 			goto out;
 		}
@@ -131,6 +131,10 @@ static int squashfs_xz_uncompress(struct squashfs_sb_info *msblk, void *strm,
 	stream->buf.out_pos = 0;
 	stream->buf.out_size = PAGE_SIZE;
 	stream->buf.out = squashfs_first_page(output);
+	if (IS_ERR(stream->buf.out)) {
+		error = PTR_ERR(stream->buf.out);
+		goto finish;
+	}
 
 	for (;;) {
 		enum xz_ret xz_err;
@@ -156,7 +160,10 @@ static int squashfs_xz_uncompress(struct squashfs_sb_info *msblk, void *strm,
 
 		if (stream->buf.out_pos == stream->buf.out_size) {
 			stream->buf.out = squashfs_next_page(output);
-			if (stream->buf.out != NULL) {
+			if (IS_ERR(stream->buf.out)) {
+				error = PTR_ERR(stream->buf.out);
+				break;
+			} else if (stream->buf.out != NULL) {
 				stream->buf.out_pos = 0;
 				total += PAGE_SIZE;
 			}
@@ -171,6 +178,7 @@ static int squashfs_xz_uncompress(struct squashfs_sb_info *msblk, void *strm,
 		}
 	}
 
+finish:
 	squashfs_finish_page(output);
 
 	return error ? error : total + stream->buf.out_pos;
@@ -183,5 +191,6 @@ const struct squashfs_decompressor squashfs_xz_comp_ops = {
 	.decompress = squashfs_xz_uncompress,
 	.id = XZ_COMPRESSION,
 	.name = "xz",
+	.alloc_buffer = 1,
 	.supported = 1
 };

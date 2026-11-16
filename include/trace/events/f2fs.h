@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #undef TRACE_SYSTEM
+#define TRACE_SYSTEM f2fs
 
 #if !defined(_TRACE_F2FS_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_F2FS_H
@@ -14,10 +15,6 @@ TRACE_DEFINE_ENUM(NODE);
 TRACE_DEFINE_ENUM(DATA);
 TRACE_DEFINE_ENUM(META);
 TRACE_DEFINE_ENUM(META_FLUSH);
-TRACE_DEFINE_ENUM(INMEM);
-TRACE_DEFINE_ENUM(INMEM_DROP);
-TRACE_DEFINE_ENUM(INMEM_INVALIDATE);
-TRACE_DEFINE_ENUM(INMEM_REVOKE);
 TRACE_DEFINE_ENUM(IPU);
 TRACE_DEFINE_ENUM(OPU);
 TRACE_DEFINE_ENUM(HOT);
@@ -58,10 +55,6 @@ TRACE_DEFINE_ENUM(CP_RESIZE);
 		{ DATA,		"DATA" },				\
 		{ META,		"META" },				\
 		{ META_FLUSH,	"META_FLUSH" },				\
-		{ INMEM,	"INMEM" },				\
-		{ INMEM_DROP,	"INMEM_DROP" },				\
-		{ INMEM_INVALIDATE,	"INMEM_INVALIDATE" },		\
-		{ INMEM_REVOKE,	"INMEM_REVOKE" },			\
 		{ IPU,		"IN-PLACE" },				\
 		{ OPU,		"OUT-OF-PLACE" })
 
@@ -144,7 +137,8 @@ TRACE_DEFINE_ENUM(CP_RESIZE);
 		{ CP_NODE_NEED_CP,	"node needs cp" },		\
 		{ CP_FASTBOOT_MODE,	"fastboot mode" },		\
 		{ CP_SPEC_LOG_NUM,	"log type is 2" },		\
-		{ CP_RECOVER_DIR,	"dir needs recovery" })
+		{ CP_RECOVER_DIR,	"dir needs recovery" },		\
+		{ CP_XATTR_DIR,		"dir's xattr updated" })
 
 #define show_shutdown_mode(type)					\
 	__print_symbolic(type,						\
@@ -512,7 +506,7 @@ TRACE_EVENT(f2fs_truncate_partial_nodes,
 	TP_STRUCT__entry(
 		__field(dev_t,	dev)
 		__field(ino_t,	ino)
-		__field(nid_t,	nid[3])
+		__array(nid_t,	nid, 3)
 		__field(int,	depth)
 		__field(int,	err)
 	),
@@ -1295,18 +1289,41 @@ DEFINE_EVENT(f2fs__page, f2fs_vm_page_mkwrite,
 	TP_ARGS(page, type)
 );
 
-DEFINE_EVENT(f2fs__page, f2fs_register_inmem_page,
+TRACE_EVENT(f2fs_replace_atomic_write_block,
 
-	TP_PROTO(struct page *page, int type),
+	TP_PROTO(struct inode *inode, struct inode *cow_inode, pgoff_t index,
+			block_t old_addr, block_t new_addr, bool recovery),
 
-	TP_ARGS(page, type)
-);
+	TP_ARGS(inode, cow_inode, index, old_addr, new_addr, recovery),
 
-DEFINE_EVENT(f2fs__page, f2fs_commit_inmem_page,
+	TP_STRUCT__entry(
+		__field(dev_t,	dev)
+		__field(ino_t,	ino)
+		__field(ino_t,	cow_ino)
+		__field(pgoff_t, index)
+		__field(block_t, old_addr)
+		__field(block_t, new_addr)
+		__field(bool, recovery)
+	),
 
-	TP_PROTO(struct page *page, int type),
+	TP_fast_assign(
+		__entry->dev		= inode->i_sb->s_dev;
+		__entry->ino		= inode->i_ino;
+		__entry->cow_ino	= cow_inode->i_ino;
+		__entry->index		= index;
+		__entry->old_addr	= old_addr;
+		__entry->new_addr	= new_addr;
+		__entry->recovery	= recovery;
+	),
 
-	TP_ARGS(page, type)
+	TP_printk("dev = (%d,%d), ino = %lu, cow_ino = %lu, index = %lu, "
+			"old_addr = 0x%llx, new_addr = 0x%llx, recovery = %d",
+		show_dev_ino(__entry),
+		__entry->cow_ino,
+		(unsigned long)__entry->index,
+		(unsigned long long)__entry->old_addr,
+		(unsigned long long)__entry->new_addr,
+		__entry->recovery)
 );
 
 TRACE_EVENT(f2fs_filemap_fault,
@@ -2073,29 +2090,6 @@ TRACE_EVENT(f2fs_fiemap,
 		__entry->ret)
 );
 
-#if IS_ENABLED(CONFIG_MTK_FSCMD_TRACER)
-TRACE_EVENT(f2fs_ck_rwsem,
-
-	TP_PROTO(uint64_t time0, uint64_t time1, unsigned long sem_count),
-
-	TP_ARGS(time0, time1, sem_count),
-
-	TP_STRUCT__entry(
-		__field(uint64_t, t0)
-		__field(uint64_t, t1)
-		__field(unsigned long, count)
-	),
-
-	TP_fast_assign(
-		__entry->t0		= time0;
-		__entry->t1		= time1;
-		__entry->count	= sem_count;
-	),
-
-	TP_printk("[fscmd] T0 %llu T1 %llu with %ld\n"
-		, __entry->t0, __entry->t1, __entry->count)
-);
-#endif
 DECLARE_EVENT_CLASS(f2fs__rw_start,
 
 	TP_PROTO(struct inode *inode, loff_t offset, int bytes,
@@ -2190,51 +2184,7 @@ DEFINE_EVENT(f2fs__rw_end, f2fs_datawrite_end,
 	TP_ARGS(inode, offset, bytes)
 );
 
-TRACE_EVENT(f2fs__unlink_file_by_dentry,
-
-	TP_PROTO(struct inode *inode),
-
-	TP_ARGS(inode),
-
-	TP_STRUCT__entry(
-		__field(ino_t,	ino)
-		__field(loff_t,	size)
-	),
-
-	TP_fast_assign(
-		__entry->ino	= inode->i_ino;
-		__entry->size	= inode->i_size;
-	),
-
-	TP_printk("ino = %lu, i_size = %lld",
-		__entry->ino,
-		__entry->size)
-);
-
-TRACE_EVENT(f2fs__handle_writeback_inode,
-
-	TP_PROTO(struct inode *inode),
-
-	TP_ARGS(inode),
-
-	TP_STRUCT__entry(
-		__field(ino_t,	ino)
-		__field(loff_t,	size)
-	),
-
-	TP_fast_assign(
-		__entry->ino	= inode->i_ino;
-		__entry->size	= inode->i_size;
-	),
-
-	TP_printk("ino = %lu, i_size = %lld",
-		__entry->ino,
-		__entry->size)
-);
-
 #endif /* _TRACE_F2FS_H */
 
-#undef TRACE_INCLUDE_FILE
-#define TRACE_INCLUDE_FILE f2fs
  /* This part must be outside protection */
 #include <trace/define_trace.h>

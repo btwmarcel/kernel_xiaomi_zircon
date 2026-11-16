@@ -406,36 +406,10 @@ static struct latched_seq clear_seq = {
 /* record buffer */
 #define LOG_ALIGN __alignof__(unsigned long)
 #define __LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
-#define LOG_BUF_LEN_MAX (u32)(1 << 31)
+#define LOG_BUF_LEN_MAX ((u32)1 << 31)
 static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
 static char *log_buf = __log_buf;
 static u32 log_buf_len = __LOG_BUF_LEN;
-
-/* console duration detect */
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-int printk_uart_status;
-struct __conwrite_stat_struct {
-	struct console *con; /* current console */
-	u64 time_before_conwrite; /* the last record before write */
-	u64 time_after_conwrite; /* the last record after write */
-	char con_write_statbuf[512]; /* con write status buf*/
-};
-u64 time_con_write_ttyS;
-u64 len_con_write_ttyS;
-static struct __conwrite_stat_struct conwrite_stat_struct = {
-	.con = NULL,
-	.time_before_conwrite = 0,
-	.time_after_conwrite = 0
-};
-unsigned long rem_nsec_con_write_ttyS;
-bool console_status_detected;
-
-void set_printk_uart_status(int value)
-{
-	printk_uart_status = value;
-}
-EXPORT_SYMBOL_GPL(set_printk_uart_status);
-#endif
 
 /*
  * Define the average message size. This only affects the number of
@@ -486,7 +460,7 @@ static u64 latched_seq_read_nolock(struct latched_seq *ls)
 		seq = raw_read_seqcount_latch(&ls->latch);
 		idx = seq & 0x1;
 		val = ls->val[idx];
-	} while (read_seqcount_latch_retry(&ls->latch, seq));
+	} while (raw_read_seqcount_latch_retry(&ls->latch, seq));
 
 	return val;
 }
@@ -1776,11 +1750,7 @@ int do_syslog(int type, char __user *buf, int len, int source)
 			 * for pending data, not the size; return the count of
 			 * records, not the length.
 			 */
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-			error = prb_next_seq_id(prb, syslog_seq) - syslog_seq;
-#else
 			error = prb_next_seq(prb) - syslog_seq;
-#endif
 		} else {
 			bool time = syslog_partial ? syslog_time : printk_time;
 			unsigned int line_count;
@@ -1950,6 +1920,12 @@ static int console_trylock_spinning(void)
 	 */
 	mutex_acquire(&console_lock_dep_map, 0, 1, _THIS_IP_);
 
+	/*
+	 * Update @console_may_schedule for trylock because the previous
+	 * owner may have been schedulable.
+	 */
+	console_may_schedule = 0;
+
 	return 1;
 }
 
@@ -1965,9 +1941,6 @@ static void call_console_drivers(const char *ext_text, size_t ext_len,
 	size_t dropped_len = 0;
 	struct console *con;
 
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	unsigned long interval_con_write = 0;
-#endif
 	trace_console_rcuidle(text, len);
 
 	if (!console_drivers)
@@ -1995,37 +1968,9 @@ static void call_console_drivers(const char *ext_text, size_t ext_len,
 		else {
 			if (dropped_len)
 				con->write(con, dropped_text, dropped_len);
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-			/* print the uart status next time enter the console_unlock */
-			if (console_status_detected) {
-				con->write(con, conwrite_stat_struct.con_write_statbuf,
-					strlen(conwrite_stat_struct.con_write_statbuf));
-			}
-
-			if (!strcmp(con->name, "ttyS")) {
-				conwrite_stat_struct.con = con;
-				conwrite_stat_struct.time_before_conwrite
-					= local_clock();
-			}
 			con->write(con, text, len);
-			if (!strcmp(con->name, "ttyS")) {
-				conwrite_stat_struct.time_after_conwrite
-					= local_clock();
-				interval_con_write =
-					conwrite_stat_struct.time_after_conwrite -
-					conwrite_stat_struct.time_before_conwrite;
-				time_con_write_ttyS += interval_con_write;
-				len_con_write_ttyS += len;
-			}
-#else
-			con->write(con, text, len);
-#endif
-			}
+		}
 	}
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	if (console_status_detected)
-		console_status_detected = false;
-#endif
 }
 
 /*
@@ -2120,15 +2065,8 @@ static inline u32 printk_caller_id(void)
 	if (caller_id)
 		return caller_id;
 
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-#define CPU_INDEX (100000)
-#define UART_INDEX (1000000)
-	return (in_task() ? 0 : 0x80000000) + printk_uart_status * UART_INDEX
-		+ raw_smp_processor_id() * CPU_INDEX + task_pid_nr(current);
-#else
 	return in_task() ? task_pid_nr(current) :
 		0x80000000 + raw_smp_processor_id();
-#endif
 }
 
 /**
@@ -2175,45 +2113,7 @@ u16 printk_parse_prefix(const char *text, int *level,
 
 	return prefix_len;
 }
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-static u16 printk_sprint(char *text, u16 size, int facility,
-			 enum printk_info_flags *flags, const char *fmt,
-			 va_list args)
-{
-	u16 text_len = 0;
-	static char textbuf[LOG_LINE_MAX];
-	char *mtk_text = textbuf;
-	u16  mtk_prefix_len = 0;
 
-
-	text_len = vscnprintf(mtk_text, sizeof(textbuf), fmt, args);
-
-	/* Mark and strip a trailing newline. */
-	if (text_len && mtk_text[text_len - 1] == '\n') {
-		text_len--;
-		*flags |= LOG_NEWLINE;
-	}
-
-	/* Strip log level and control flags. */
-	if (facility == 0) {
-		u16 prefix_len;
-
-		prefix_len = printk_parse_prefix(mtk_text, NULL, flags);
-		if (prefix_len) {
-			text_len -= prefix_len;
-			memmove(mtk_text, mtk_text + prefix_len, text_len);
-		}
-	}
-
-	if (!(*flags & LOG_CONT)) {
-		mtk_prefix_len = scnprintf(text, size, "%s: ", current->comm);
-		text_len += mtk_prefix_len;
-	}
-	memmove(text + mtk_prefix_len, mtk_text, size - mtk_prefix_len);
-
-	return text_len;
-}
-#else
 static u16 printk_sprint(char *text, u16 size, int facility,
 			 enum printk_info_flags *flags, const char *fmt,
 			 va_list args)
@@ -2241,7 +2141,6 @@ static u16 printk_sprint(char *text, u16 size, int facility,
 
 	return text_len;
 }
-#endif
 
 __printf(4, 0)
 int vprintk_store(int facility, int level,
@@ -2321,11 +2220,6 @@ int vprintk_store(int facility, int level,
 	 * prb_reserve_in_last() and prb_reserve() purposely invalidate the
 	 * structure when they fail.
 	 */
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	reserve_size += strlen(current->comm) + 3;
-	if (reserve_size > LOG_LINE_MAX)
-		reserve_size = LOG_LINE_MAX;
-#endif
 	prb_rec_init_wr(&r, reserve_size);
 	if (!prb_reserve(&e, prb, &r)) {
 		/* truncate the message if it is too long for empty buffer */
@@ -2401,7 +2295,11 @@ asmlinkage int vprintk_emit(int facility, int level,
 		preempt_enable();
 	}
 
-	wake_up_klogd();
+	if (in_sched)
+		defer_console_output();
+	else
+		wake_up_klogd();
+
 	return printed_len;
 }
 EXPORT_SYMBOL(vprintk_emit);
@@ -2770,15 +2668,6 @@ void console_unlock(void)
 	struct printk_record r;
 	u64 __maybe_unused next_seq;
 
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	u64 con_dura_time = local_clock();
-	u64 current_time;
-
-	len_con_write_ttyS = 0;
-	time_con_write_ttyS = 0;
-	rem_nsec_con_write_ttyS = 0;
-#endif
-
 	if (console_suspended) {
 		up_console_sem();
 		return;
@@ -2824,42 +2713,6 @@ skip:
 		if (!prb_read_valid(prb, console_seq, &r))
 			break;
 
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-		/* console_unlock block time over 2 seconds */
-		current_time = local_clock();
-		if ((current_time - con_dura_time) > 2000000000ULL) {
-			unsigned long tmp_rem_nsec_start = 0,
-				tmp_rem_nsec_end = 0;
-			console_status_detected = true;
-
-			rem_nsec_con_write_ttyS = do_div
-				(time_con_write_ttyS, 1000000000);
-			tmp_rem_nsec_start = do_div(con_dura_time, 1000000000);
-			tmp_rem_nsec_end = do_div(current_time, 1000000000);
-			memset(conwrite_stat_struct.con_write_statbuf, 0x0,
-				sizeof(conwrite_stat_struct.con_write_statbuf)
-				- 1);
-			if (snprintf(conwrite_stat_struct.con_write_statbuf,
-				sizeof(conwrite_stat_struct.con_write_statbuf)
-				- 1,
-"cpu%d [%lu.%06lu]--[%lu.%06lu] 'ttyS' %lubytes %lu.%06lus, uart dump:%s\n",
-				smp_processor_id(),
-				(unsigned long)con_dura_time,
-				tmp_rem_nsec_start/1000,
-				(unsigned long)current_time,
-				tmp_rem_nsec_end/1000,
-				(unsigned long)len_con_write_ttyS,
-				(unsigned long)time_con_write_ttyS,
-				rem_nsec_con_write_ttyS/1000,
-				"") < 0) {
-				conwrite_stat_struct.con_write_statbuf[0] = 'N';
-				conwrite_stat_struct.con_write_statbuf[1] = 'A';
-				conwrite_stat_struct.con_write_statbuf[2] = '\0';
-			}
-			con_dura_time = local_clock();
-			break;
-		}
-#endif
 		if (console_seq != r.info->seq) {
 			console_dropped += r.info->seq - console_seq;
 			console_seq = r.info->seq;
@@ -3058,6 +2911,21 @@ static int __init keep_bootcon_setup(char *str)
 
 early_param("keep_bootcon", keep_bootcon_setup);
 
+static int console_call_setup(struct console *newcon, char *options)
+{
+	int err;
+
+	if (!newcon->setup)
+		return 0;
+
+	/* Synchronize with possible boot console. */
+	console_lock();
+	err = newcon->setup(newcon, options);
+	console_unlock();
+
+	return err;
+}
+
 /*
  * This is called by register_console() to try to match
  * the newly registered console with any of the ones selected
@@ -3067,7 +2935,8 @@ early_param("keep_bootcon", keep_bootcon_setup);
  * Care need to be taken with consoles that are statically
  * enabled such as netconsole
  */
-static int try_enable_new_console(struct console *newcon, bool user_specified)
+static int try_enable_preferred_console(struct console *newcon,
+					bool user_specified)
 {
 	struct console_cmdline *c;
 	int i, err;
@@ -3092,8 +2961,8 @@ static int try_enable_new_console(struct console *newcon, bool user_specified)
 			if (_braille_register_console(newcon, c))
 				return 0;
 
-			if (newcon->setup &&
-			    (err = newcon->setup(newcon, c->options)) != 0)
+			err = console_call_setup(newcon, c->options);
+			if (err)
 				return err;
 		}
 		newcon->flags |= CON_ENABLED;
@@ -3113,6 +2982,23 @@ static int try_enable_new_console(struct console *newcon, bool user_specified)
 		return 0;
 
 	return -ENOENT;
+}
+
+/* Try to enable the console unconditionally */
+static void try_enable_default_console(struct console *newcon)
+{
+	if (newcon->index < 0)
+		newcon->index = 0;
+
+	if (console_call_setup(newcon, NULL) != 0)
+		return;
+
+	newcon->flags |= CON_ENABLED;
+
+	if (newcon->device) {
+		newcon->flags |= CON_CONSDEV;
+		has_preferred_console = true;
+	}
 }
 
 /*
@@ -3170,25 +3056,15 @@ void register_console(struct console *newcon)
 	 *	didn't select a console we take the first one
 	 *	that registers here.
 	 */
-	if (!has_preferred_console) {
-		if (newcon->index < 0)
-			newcon->index = 0;
-		if (newcon->setup == NULL ||
-		    newcon->setup(newcon, NULL) == 0) {
-			newcon->flags |= CON_ENABLED;
-			if (newcon->device) {
-				newcon->flags |= CON_CONSDEV;
-				has_preferred_console = true;
-			}
-		}
-	}
+	if (!has_preferred_console)
+		try_enable_default_console(newcon);
 
 	/* See if this console matches one we selected on the command line */
-	err = try_enable_new_console(newcon, true);
+	err = try_enable_preferred_console(newcon, true);
 
 	/* If not, try to match against the platform default(s) */
 	if (err == -ENOENT)
-		err = try_enable_new_console(newcon, false);
+		err = try_enable_preferred_console(newcon, false);
 
 	/* printk() messages are not printed to the Braille console. */
 	if (err || newcon->flags & CON_BRL)
@@ -3247,10 +3123,6 @@ void register_console(struct console *newcon)
 	console_unlock();
 	console_sysfs_notify();
 
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	if (!strncmp(newcon->name, "ttyS", 4))
-		printk_uart_status = 1;
-#endif
 	/*
 	 * By unregistering the bootconsoles after we enable the real console
 	 * we get the "console xxx enabled" message on all the consoles -
@@ -3278,10 +3150,6 @@ int unregister_console(struct console *console)
 {
 	struct console *con;
 	int res;
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	if (!strncmp(console->name, "ttyS", 4))
-		printk_uart_status = 0;
-#endif
 
 	pr_info("%sconsole [%s%d] disabled\n",
 		(console->flags & CON_BOOT) ? "boot" : "" ,
@@ -3426,53 +3294,18 @@ late_initcall(printk_late_init);
 
 static DEFINE_PER_CPU(int, printk_pending);
 
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-unsigned long long printk_irq_t0;
-unsigned long long printk_irq_t1;
-int wake_up_type;
-
-int get_printk_wake_up_time(unsigned long long *t0, unsigned long long *t1)
-{
-	*t0 = printk_irq_t0;
-	*t1 = printk_irq_t1;
-	printk_irq_t0 = 0;
-	printk_irq_t1 = 0;
-	return wake_up_type;
-}
-EXPORT_SYMBOL_GPL(get_printk_wake_up_time);
-#endif
-
 static void wake_up_klogd_work_func(struct irq_work *irq_work)
 {
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	unsigned long long t0;
-	unsigned long long t1;
-	unsigned long long t2;
-#endif
 	int pending = this_cpu_xchg(printk_pending, 0);
 
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	t0 = local_clock();
-#endif
 	if (pending & PRINTK_PENDING_OUTPUT) {
 		/* If trylock fails, someone else is doing the printing */
 		if (console_trylock())
 			console_unlock();
 	}
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	t1 = local_clock();
-#endif
 
 	if (pending & PRINTK_PENDING_WAKEUP)
 		wake_up_interruptible(&log_wait);
-#ifdef CONFIG_MTK_PRINTK_DEBUG
-	t2 = local_clock();
-	if (t2 - t0 > 1000000) {
-		printk_irq_t0 = t1 - t0;
-		printk_irq_t1 = t2 - t1;
-		wake_up_type = pending;
-	}
-#endif
 }
 
 static DEFINE_PER_CPU(struct irq_work, wake_up_klogd_work) =
@@ -3503,11 +3336,33 @@ static void __wake_up_klogd(int val)
 	preempt_enable();
 }
 
+/**
+ * wake_up_klogd - Wake kernel logging daemon
+ *
+ * Use this function when new records have been added to the ringbuffer
+ * and the console printing of those records has already occurred or is
+ * known to be handled by some other context. This function will only
+ * wake the logging daemon.
+ *
+ * Context: Any context.
+ */
 void wake_up_klogd(void)
 {
 	__wake_up_klogd(PRINTK_PENDING_WAKEUP);
 }
 
+/**
+ * defer_console_output - Wake kernel logging daemon and trigger
+ *	console printing in a deferred context
+ *
+ * Use this function when new records have been added to the ringbuffer,
+ * this context is responsible for console printing those records, but
+ * the current context is not allowed to perform the console printing.
+ * Trigger an irq_work context to perform the console printing. This
+ * function also wakes the logging daemon.
+ *
+ * Context: Any context.
+ */
 void defer_console_output(void)
 {
 	/*
@@ -3524,12 +3379,7 @@ void printk_trigger_flush(void)
 
 int vprintk_deferred(const char *fmt, va_list args)
 {
-	int r;
-
-	r = vprintk_emit(0, LOGLEVEL_SCHED, NULL, fmt, args);
-	defer_console_output();
-
-	return r;
+	return vprintk_emit(0, LOGLEVEL_SCHED, NULL, fmt, args);
 }
 
 int _printk_deferred(const char *fmt, ...)

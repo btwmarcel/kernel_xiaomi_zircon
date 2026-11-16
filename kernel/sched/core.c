@@ -661,13 +661,15 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
 #endif
 #ifdef CONFIG_PARAVIRT_TIME_ACCOUNTING
 	if (static_key_false((&paravirt_steal_rq_enabled))) {
-		steal = paravirt_steal_clock(cpu_of(rq));
+		u64 prev_steal;
+
+		steal = prev_steal = paravirt_steal_clock(cpu_of(rq));
 		steal -= rq->prev_steal_time_rq;
 
 		if (unlikely(steal > delta))
 			steal = delta;
 
-		rq->prev_steal_time_rq += steal;
+		rq->prev_steal_time_rq = prev_steal;
 		delta -= steal;
 	}
 #endif
@@ -960,10 +962,11 @@ void wake_up_q(struct wake_q_head *head)
 		struct task_struct *task;
 
 		task = container_of(node, struct task_struct, wake_q);
-		/* Task can safely be re-inserted now: */
 		node = node->next;
-		task->wake_q.next = NULL;
 		task->wake_q_count = head->count;
+		/* pairs with cmpxchg_relaxed() in __wake_q_add() */
+		WRITE_ONCE(task->wake_q.next, NULL);
+		/* Task can safely be re-inserted now. */
 
 		/*
 		 * wake_up_process() executes a full barrier, which pairs with
@@ -985,11 +988,15 @@ void wake_up_q(struct wake_q_head *head)
 void resched_curr(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
-	int cpu;
+	int cpu, need_lazy = 0;
 
 	lockdep_assert_rq_held(rq);
 
 	if (test_tsk_need_resched(curr))
+		return;
+
+	trace_android_vh_set_tsk_need_resched_lazy(curr, rq, &need_lazy);
+	if (need_lazy)
 		return;
 
 	cpu = cpu_of(rq);
@@ -1135,9 +1142,9 @@ static void nohz_csd_func(void *info)
 	WARN_ON(!(flags & NOHZ_KICK_MASK));
 
 	rq->idle_balance = idle_cpu(cpu);
-	if (rq->idle_balance && !need_resched()) {
+	if (rq->idle_balance) {
 		rq->nohz_idle_balance = flags;
-		raise_softirq_irqoff(SCHED_SOFTIRQ);
+		__raise_softirq_irqoff(SCHED_SOFTIRQ);
 	}
 }
 
@@ -1365,7 +1372,7 @@ static inline void uclamp_idle_reset(struct rq *rq, enum uclamp_id clamp_id,
 	if (!(rq->uclamp_flags & UCLAMP_FLAG_IDLE))
 		return;
 
-	WRITE_ONCE(rq->uclamp[clamp_id].value, clamp_value);
+	uclamp_rq_set(rq, clamp_id, clamp_value);
 }
 
 static inline
@@ -1550,8 +1557,8 @@ static inline void uclamp_rq_inc_id(struct rq *rq, struct task_struct *p,
 	if (bucket->tasks == 1 || uc_se->value > bucket->value)
 		bucket->value = uc_se->value;
 
-	if (uc_se->value > READ_ONCE(uc_rq->value))
-		WRITE_ONCE(uc_rq->value, uc_se->value);
+	if (uc_se->value > uclamp_rq_get(rq, clamp_id))
+		uclamp_rq_set(rq, clamp_id, uc_se->value);
 }
 
 /*
@@ -1617,7 +1624,7 @@ static inline void uclamp_rq_dec_id(struct rq *rq, struct task_struct *p,
 	if (likely(bucket->tasks))
 		return;
 
-	rq_clamp = READ_ONCE(uc_rq->value);
+	rq_clamp = uclamp_rq_get(rq, clamp_id);
 	/*
 	 * Defensive programming: this should never happen. If it happens,
 	 * e.g. due to future modification, warn and fixup the expected value.
@@ -1625,7 +1632,7 @@ static inline void uclamp_rq_dec_id(struct rq *rq, struct task_struct *p,
 	SCHED_WARN_ON(bucket->value > rq_clamp);
 	if (bucket->value >= rq_clamp) {
 		bkt_clamp = uclamp_rq_max_value(rq, clamp_id, uc_se->value);
-		WRITE_ONCE(uc_rq->value, bkt_clamp);
+		uclamp_rq_set(rq, clamp_id, bkt_clamp);
 	}
 }
 
@@ -2002,6 +2009,25 @@ bool sched_task_on_rq(struct task_struct *p)
 	return task_on_rq_queued(p);
 }
 
+unsigned long get_wchan(struct task_struct *p)
+{
+	unsigned long ip = 0;
+	unsigned int state;
+
+	if (!p || p == current)
+		return 0;
+
+	/* Only get wchan if task is blocked and we can keep it that way. */
+	raw_spin_lock_irq(&p->pi_lock);
+	state = READ_ONCE(p->__state);
+	smp_rmb(); /* see try_to_wake_up() */
+	if (state != TASK_RUNNING && state != TASK_WAKING && !p->on_rq)
+		ip = __get_wchan(p);
+	raw_spin_unlock_irq(&p->pi_lock);
+
+	return ip;
+}
+
 static inline void enqueue_task(struct rq *rq, struct task_struct *p, int flags)
 {
 	if (!(flags & ENQUEUE_NOCLOCK))
@@ -2042,6 +2068,9 @@ static inline void dequeue_task(struct rq *rq, struct task_struct *p, int flags)
 
 void activate_task(struct rq *rq, struct task_struct *p, int flags)
 {
+	if (task_on_rq_migrating(p))
+		flags |= ENQUEUE_MIGRATED;
+
 	enqueue_task(rq, p, flags);
 
 	p->on_rq = TASK_ON_RQ_QUEUED;
@@ -2441,9 +2470,11 @@ static int migration_cpu_stop(void *data)
 		 * it.
 		 */
 		WARN_ON_ONCE(!pending->stop_pending);
+		preempt_disable();
 		task_rq_unlock(rq, p, &rf);
 		stop_one_cpu_nowait(task_cpu(p), migration_cpu_stop,
 				    &pending->arg, &pending->stop_work);
+		preempt_enable();
 		return 0;
 	}
 out:
@@ -2499,6 +2530,7 @@ out_unlock:
 	put_task_struct(p);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(push_cpu_stop);
 
 /*
  * sched_class::set_cpus_allowed must do the below, but is not required to
@@ -2725,12 +2757,13 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
 			complete = true;
 		}
 
+		preempt_disable();
 		task_rq_unlock(rq, p, rf);
-
 		if (push_task) {
 			stop_one_cpu_nowait(rq->cpu, push_cpu_stop,
 					    p, &rq->push_work);
 		}
+		preempt_enable();
 
 		if (complete)
 			complete_all(&pending->done);
@@ -2796,12 +2829,13 @@ static int affine_move_task(struct rq *rq, struct task_struct *p, struct rq_flag
 		if (flags & SCA_MIGRATE_ENABLE)
 			p->migration_flags &= ~MDF_PUSH;
 
+		preempt_disable();
 		task_rq_unlock(rq, p, rf);
-
 		if (!stop_pending) {
 			stop_one_cpu_nowait(cpu_of(rq), migration_cpu_stop,
 					    &pending->arg, &pending->stop_work);
 		}
+		preempt_enable();
 
 		if (flags & SCA_MIGRATE_ENABLE)
 			return 0;
@@ -3093,20 +3127,13 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 {
 #ifdef CONFIG_SCHED_DEBUG
 	unsigned int state = READ_ONCE(p->__state);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	u64 ts[7] = {0};
 
-	ts[0] = sched_clock();
-#endif
 	/*
 	 * We should never call set_task_cpu() on a blocked task,
 	 * ttwu() will sort out the placement.
 	 */
 	WARN_ON_ONCE(state != TASK_RUNNING && state != TASK_WAKING && !p->on_rq);
 
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[1] = sched_clock();
-#endif
 	/*
 	 * Migrating fair class task must have p->on_rq = TASK_ON_RQ_MIGRATING,
 	 * because schedstat_wait_{start,end} rebase migrating task's wait_start
@@ -3115,9 +3142,7 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 	WARN_ON_ONCE(state == TASK_RUNNING &&
 		     p->sched_class == &fair_sched_class &&
 		     (p->on_rq && !task_on_rq_migrating(p)));
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[2] = sched_clock();
-#endif
+
 #ifdef CONFIG_LOCKDEP
 	/*
 	 * The caller should hold either p->pi_lock or rq->lock, when changing
@@ -3132,9 +3157,6 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 	WARN_ON_ONCE(debug_locks && !(lockdep_is_held(&p->pi_lock) ||
 				      lockdep_is_held(__rq_lockp(task_rq(p)))));
 #endif
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[3] = sched_clock();
-#endif
 	/*
 	 * Clearly, migrating tasks to offline CPUs is a fairly daft thing.
 	 */
@@ -3142,9 +3164,7 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 
 	WARN_ON_ONCE(is_migration_disabled(p));
 #endif
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[4] = sched_clock();
-#endif
+
 	trace_sched_migrate_task(p, new_cpu);
 
 	if (task_cpu(p) != new_cpu) {
@@ -3155,23 +3175,8 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 		perf_event_task_migrate(p);
 		trace_android_rvh_set_task_cpu(p, new_cpu);
 	}
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[5] = sched_clock();
-#endif
+
 	__set_task_cpu(p, new_cpu);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[6] = sched_clock();
-
-	if ((ts[6] - ts[0] > 500000ULL) && in_hardirq()) {
-		int i;
-
-		printk_deferred("%s duration %llu, ts[0]=%llu\n", __func__, ts[6] - ts[0], ts[0]);
-		for (i = 0; i < 6; i++) {
-			printk_deferred("%s ts[%d]=%llu, duration=%llu\n",
-					__func__, i+1, ts[i + 1], ts[i + 1] - ts[i]);
-		}
-	}
-#endif
 }
 EXPORT_SYMBOL_GPL(set_task_cpu);
 
@@ -3659,23 +3664,10 @@ ttwu_stat(struct task_struct *p, int cpu, int wake_flags)
 static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
 			   struct rq_flags *rf)
 {
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	u64 ts[6] = {0};
-
-	ts[0] = sched_clock();
-#endif
 	check_preempt_curr(rq, p, wake_flags);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[1] = sched_clock();
-#endif
 	WRITE_ONCE(p->__state, TASK_RUNNING);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[2] = sched_clock();
-#endif
 	trace_sched_wakeup(p);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[3] = sched_clock();
-#endif
+
 #ifdef CONFIG_SMP
 	if (p->sched_class->task_woken) {
 		/*
@@ -3686,9 +3678,7 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
 		p->sched_class->task_woken(rq, p);
 		rq_repin_lock(rq, rf);
 	}
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[4] = sched_clock();
-#endif
+
 	if (rq->idle_stamp) {
 		u64 delta = rq_clock(rq) - rq->idle_stamp;
 		u64 max = 2*rq->max_idle_balance_cost;
@@ -3704,19 +3694,6 @@ static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
 		rq->idle_stamp = 0;
 	}
 #endif
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[5] = sched_clock();
-
-	if ((ts[5] - ts[0] > 3000000ULL) && in_hardirq()) {
-		int i;
-
-		printk_deferred("%s duration %llu, ts[0]=%llu\n", __func__, ts[5] - ts[0], ts[0]);
-		for (i = 0; i < 5; i++) {
-			printk_deferred("%s ts[%d]=%llu, duration=%llu\n",
-					__func__, i+1, ts[i + 1], ts[i + 1] - ts[i]);
-		}
-	}
-#endif
 }
 
 static void
@@ -3724,26 +3701,15 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 		 struct rq_flags *rf)
 {
 	int en_flags = ENQUEUE_WAKEUP | ENQUEUE_NOCLOCK;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	u64 ts[7] = {0};
-
-	ts[0] = sched_clock();
-#endif
 
 	if (wake_flags & WF_SYNC)
 		en_flags |= ENQUEUE_WAKEUP_SYNC;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[1] = sched_clock();
-#endif
+
 	lockdep_assert_rq_held(rq);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[2] = sched_clock();
-#endif
+
 	if (p->sched_contributes_to_load)
 		rq->nr_uninterruptible--;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[3] = sched_clock();
-#endif
+
 #ifdef CONFIG_SMP
 	if (wake_flags & WF_MIGRATED)
 		en_flags |= ENQUEUE_MIGRATED;
@@ -3753,27 +3719,9 @@ ttwu_do_activate(struct rq *rq, struct task_struct *p, int wake_flags,
 		delayacct_blkio_end(p);
 		atomic_dec(&task_rq(p)->nr_iowait);
 	}
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[4] = sched_clock();
-#endif
+
 	activate_task(rq, p, en_flags);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[5] = sched_clock();
-#endif
 	ttwu_do_wakeup(rq, p, wake_flags, rf);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[6] = sched_clock();
-
-	if ((ts[6] - ts[0] > 4000000ULL) && in_hardirq()) {
-		int i;
-
-		printk_deferred("%s duration %llu, ts[0]=%llu\n", __func__, ts[6] - ts[0], ts[0]);
-		for (i = 0; i < 6; i++) {
-			printk_deferred("%s ts[%d]=%llu, duration=%llu\n",
-					__func__, i+1, ts[i + 1], ts[i + 1] - ts[i]);
-		}
-	}
-#endif
 }
 
 /*
@@ -3826,32 +3774,20 @@ void sched_ttwu_pending(void *arg)
 	struct rq *rq = this_rq();
 	struct task_struct *p, *t;
 	struct rq_flags rf;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	u64 ts[6] = {0};
-#endif
 
 	if (!llist)
 		return;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[0] = sched_clock();
-#endif
+
 	/*
 	 * rq::ttwu_pending racy indication of out-standing wakeups.
 	 * Races such that false-negatives are possible, since they
 	 * are shorter lived that false-positives would be.
 	 */
 	WRITE_ONCE(rq->ttwu_pending, 0);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[1] = sched_clock();
-#endif
+
 	rq_lock_irqsave(rq, &rf);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[2] = sched_clock();
-#endif
 	update_rq_clock(rq);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[3] = sched_clock();
-#endif
+
 	llist_for_each_entry_safe(p, t, llist, wake_entry.llist) {
 		if (WARN_ON_ONCE(p->on_cpu))
 			smp_cond_load_acquire(&p->on_cpu, !VAL);
@@ -3861,25 +3797,8 @@ void sched_ttwu_pending(void *arg)
 
 		ttwu_do_activate(rq, p, p->sched_remote_wakeup ? WF_MIGRATED : 0, &rf);
 	}
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[4] = sched_clock();
-#endif
 
 	rq_unlock_irqrestore(rq, &rf);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[5] = sched_clock();
-
-	if ((ts[5] - ts[0] > 4500000ULL) && in_hardirq()) {
-		int i;
-
-		printk_deferred("%s duration %llu, ts[0]=%llu\n", __func__, ts[5] - ts[0], ts[0]);
-		for (i = 0; i < 5; i++) {
-			printk_deferred("%s ts[%d]=%llu, duration=%llu\n",
-					__func__, i+1, ts[i + 1], ts[i + 1] - ts[i]);
-		}
-	}
-#endif
-
 }
 
 void send_call_function_single_ipi(int cpu)
@@ -4193,13 +4112,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 {
 	unsigned long flags;
 	int cpu, success = 0;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	u64 ts[14] = {0};
-#endif
 
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[0] = sched_clock();
-#endif
 	preempt_disable();
 	if (p == current) {
 		/*
@@ -4221,9 +4134,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 		trace_sched_wakeup(p);
 		goto out;
 	}
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[1] = sched_clock();
-#endif
+
 	/*
 	 * If we are going to wake up a thread waiting for CONDITION we
 	 * need to ensure that CONDITION=1 done by the caller can not be
@@ -4231,16 +4142,10 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	 * in set_current_state() that the waiting thread does.
 	 */
 	raw_spin_lock_irqsave(&p->pi_lock, flags);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[2] = sched_clock();
-#endif
 	smp_mb__after_spinlock();
 	if (!ttwu_state_match(p, state, &success))
 		goto unlock;
 
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[3] = sched_clock();
-#endif
 #ifdef CONFIG_FREEZER
 	/*
 	 * If we're going to wake up a thread which may be frozen, then
@@ -4253,9 +4158,7 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	    !cpumask_intersects(cpu_active_mask, task_cpu_possible_mask(p)))
 		goto unlock;
 #endif
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[4] = sched_clock();
-#endif
+
 	trace_sched_waking(p);
 
 	/*
@@ -4283,9 +4186,6 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	smp_rmb();
 	if (READ_ONCE(p->on_rq) && ttwu_runnable(p, wake_flags))
 		goto unlock;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[5] = sched_clock();
-#endif
 
 	if (READ_ONCE(p->__state) & TASK_UNINTERRUPTIBLE)
 		trace_sched_blocked_reason(p);
@@ -4343,15 +4243,9 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	 * to ensure we observe the correct CPU on which the task is currently
 	 * scheduling.
 	 */
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[6] = sched_clock();
-#endif
 	if (smp_load_acquire(&p->on_cpu) &&
 	    ttwu_queue_wakelist(p, task_cpu(p), wake_flags))
 		goto unlock;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[7] = sched_clock();
-#endif
 
 	/*
 	 * If the owning (remote) CPU is still in the middle of schedule() with
@@ -4365,13 +4259,8 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 	smp_cond_load_acquire(&p->on_cpu, !VAL);
 
 	trace_android_rvh_try_to_wake_up(p);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[8] = sched_clock();
-#endif
+
 	cpu = select_task_rq(p, p->wake_cpu, wake_flags | WF_TTWU);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[9] = sched_clock();
-#endif
 	if (task_cpu(p) != cpu) {
 		if (p->in_iowait) {
 			delayacct_blkio_end(p);
@@ -4385,38 +4274,17 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
 #else
 	cpu = task_cpu(p);
 #endif /* CONFIG_SMP */
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[10] = sched_clock();
-#endif
+
 	ttwu_queue(p, cpu, wake_flags);
 unlock:
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[11] = sched_clock();
-#endif
 	raw_spin_unlock_irqrestore(&p->pi_lock, flags);
 out:
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[12] = sched_clock();
-#endif
 	if (success) {
 		trace_android_rvh_try_to_wake_up_success(p);
 		ttwu_stat(p, task_cpu(p), wake_flags);
 	}
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[13] = sched_clock();
-#endif
 	preempt_enable();
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	if ((ts[13] - ts[0] > 4000000ULL) && in_hardirq()) {
-		int i;
 
-		printk_deferred("%s duration %llu, ts[0]=%llu\n", __func__, ts[13] - ts[0], ts[0]);
-		for (i = 0; i < 13; i++) {
-			printk_deferred("%s ts[%d]=%llu, duration=%llu\n",
-					__func__, i+1, ts[i + 1], ts[i + 1] - ts[i]);
-		}
-	}
-#endif
 	return success;
 }
 
@@ -4486,6 +4354,7 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 {
 	return try_to_wake_up(p, state, 0);
 }
+EXPORT_SYMBOL(wake_up_state);
 
 /*
  * Perform scheduler related setup for a newly forked process p.
@@ -4745,7 +4614,7 @@ void sched_post_fork(struct task_struct *p)
 	uclamp_post_fork(p);
 }
 
-unsigned long to_ratio(u64 period, u64 runtime)
+u64 to_ratio(u64 period, u64 runtime)
 {
 	if (runtime == RUNTIME_INF)
 		return BW_UNIT;
@@ -5328,6 +5197,7 @@ unsigned int nr_running(void)
 
 	return sum;
 }
+EXPORT_SYMBOL(nr_running);
 
 /*
  * Check if only the current task is running on the CPU.
@@ -5575,87 +5445,35 @@ void scheduler_tick(void)
 	struct rq_flags rf;
 	unsigned long thermal_pressure;
 	u64 resched_latency;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	u64 ts[16] = {0};
-
-	ts[0] = sched_clock();
-#endif
 
 	arch_scale_freq_tick();
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[1] = sched_clock();
-#endif
 	sched_clock_tick();
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[2] = sched_clock();
-#endif
+
 	rq_lock(rq, &rf);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[3] = sched_clock();
-#endif
+
 	update_rq_clock(rq);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[4] = sched_clock();
-#endif
 	trace_android_rvh_tick_entry(rq);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[5] = sched_clock();
-#endif
+
 	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[6] = sched_clock();
-#endif
 	update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[7] = sched_clock();
-#endif
 	curr->sched_class->task_tick(rq, curr, 0);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[8] = sched_clock();
-#endif
 	if (sched_feat(LATENCY_WARN))
 		resched_latency = cpu_resched_latency(rq);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[9] = sched_clock();
-#endif
 	calc_global_load_tick(rq);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[10] = sched_clock();
-#endif
+
 	rq_unlock(rq, &rf);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[11] = sched_clock();
-#endif
+
 	if (sched_feat(LATENCY_WARN) && resched_latency)
 		resched_latency_warn(cpu, resched_latency);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[12] = sched_clock();
-#endif
+
 	perf_event_task_tick();
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[13] = sched_clock();
-#endif
+
 #ifdef CONFIG_SMP
 	rq->idle_balance = idle_cpu(cpu);
 	trigger_load_balance(rq);
 #endif
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[14] = sched_clock();
-#endif
+
 	trace_android_vh_scheduler_tick(rq);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[15] = sched_clock();
-
-	if ((ts[15] - ts[0] > 5000000ULL) && in_hardirq()) {
-		int i;
-
-		printk_deferred("%s duration %llu, ts[0]=%llu\n", __func__, ts[15] - ts[0], ts[0]);
-		for (i = 0; i < 15; i++) {
-			printk_deferred("%s ts[%d]=%llu, duration=%llu\n",
-					__func__, i+1, ts[i + 1], ts[i + 1] - ts[i]);
-		}
-	}
-#endif
 }
 
 #ifdef CONFIG_NO_HZ_FULL
@@ -5915,9 +5733,6 @@ static noinline void __schedule_bug(struct task_struct *prev)
 
 	dump_stack();
 	add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
-#if IS_ENABLED(CONFIG_MTK_PANIC_ON_WARN)
-	BUG();
-#endif
 }
 
 /*
@@ -5939,9 +5754,6 @@ static inline void schedule_debug(struct task_struct *prev, bool preempt)
 			prev->comm, prev->pid, prev->non_block_count);
 		dump_stack();
 		add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
-#if IS_ENABLED(CONFIG_MTK_PANIC_ON_WARN)
-		BUG();
-#endif
 	}
 #endif
 
@@ -7191,15 +7003,17 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	const struct sched_class *prev_class;
 	struct rq_flags rf;
 	struct rq *rq;
+	int update = 0;
 
 	trace_android_rvh_rtmutex_prepare_setprio(p, pi_task);
 	/* XXX used to be waiter->prio, not waiter->task->prio */
 	prio = __rt_effective_prio(pi_task, p->normal_prio);
 
+	trace_android_rvh_rtmutex_force_update(p, pi_task, &update);
 	/*
 	 * If nothing changed; bail early.
 	 */
-	if (p->pi_top_task == pi_task && prio == p->prio && !dl_prio(prio))
+	if (!update && p->pi_top_task == pi_task && prio == p->prio && !dl_prio(prio))
 		return;
 
 	rq = __task_rq_lock(p, &rf);
@@ -7219,7 +7033,7 @@ void rt_mutex_setprio(struct task_struct *p, struct task_struct *pi_task)
 	/*
 	 * For FIFO/RR we only need to set prio, if that matches we're done.
 	 */
-	if (prio == p->prio && !dl_prio(prio))
+	if (!update && prio == p->prio && !dl_prio(prio))
 		goto out_unlock;
 
 	/*
@@ -7325,6 +7139,10 @@ void set_user_nice(struct task_struct *p, long nice)
 	 */
 	rq = task_rq_lock(p, &rf);
 	update_rq_clock(rq);
+
+	trace_android_rvh_set_user_nice_locked(p, &nice);
+	if (task_nice(p) == nice)
+		goto out_unlock;
 
 	/*
 	 * The RT priorities are set via sched_setscheduler(), but we still
@@ -7672,6 +7490,7 @@ static int __sched_setscheduler(struct task_struct *p,
 	int reset_on_fork;
 	int queue_flags = DEQUEUE_SAVE | DEQUEUE_MOVE | DEQUEUE_NOCLOCK;
 	struct rq *rq;
+	bool cpuset_locked = false;
 
 	/* The pi code expects interrupts enabled */
 	BUG_ON(pi && in_interrupt());
@@ -7773,6 +7592,15 @@ recheck:
 	}
 
 	/*
+	 * SCHED_DEADLINE bandwidth accounting relies on stable cpusets
+	 * information.
+	 */
+	if (dl_policy(policy) || dl_policy(p->policy)) {
+		cpuset_locked = true;
+		cpuset_lock();
+	}
+
+	/*
 	 * Make sure no PI-waiters arrive (or leave) while we are
 	 * changing the priority of the task:
 	 *
@@ -7846,6 +7674,8 @@ change:
 	if (unlikely(oldpolicy != -1 && oldpolicy != p->policy)) {
 		policy = oldpolicy = -1;
 		task_rq_unlock(rq, p, &rf);
+		if (cpuset_locked)
+			cpuset_unlock();
 		goto recheck;
 	}
 
@@ -7911,8 +7741,11 @@ change:
 	head = splice_balance_callbacks(rq);
 	task_rq_unlock(rq, p, &rf);
 
-	if (pi)
+	if (pi) {
+		if (cpuset_locked)
+			cpuset_unlock();
 		rt_mutex_adjust_pi(p);
+	}
 
 	/* Run balance callbacks after we've adjusted the PI chain: */
 	balance_callbacks(rq, head);
@@ -7922,6 +7755,8 @@ change:
 
 unlock:
 	task_rq_unlock(rq, p, &rf);
+	if (cpuset_locked)
+		cpuset_unlock();
 	return retval;
 }
 
@@ -8548,14 +8383,14 @@ SYSCALL_DEFINE3(sched_getaffinity, pid_t, pid, unsigned int, len,
 	if (len & (sizeof(unsigned long)-1))
 		return -EINVAL;
 
-	if (!alloc_cpumask_var(&mask, GFP_KERNEL))
+	if (!zalloc_cpumask_var(&mask, GFP_KERNEL))
 		return -ENOMEM;
 
 	ret = sched_getaffinity(pid, mask);
 	if (ret == 0) {
 		unsigned int retlen = min(len, cpumask_size());
 
-		if (copy_to_user(user_mask_ptr, mask, retlen))
+		if (copy_to_user(user_mask_ptr, cpumask_bits(mask), retlen))
 			ret = -EFAULT;
 		else
 			ret = retlen;
@@ -8601,7 +8436,7 @@ SYSCALL_DEFINE0(sched_yield)
 #if !defined(CONFIG_PREEMPTION) || defined(CONFIG_PREEMPT_DYNAMIC)
 int __sched __cond_resched(void)
 {
-	if (should_resched(0)) {
+	if (should_resched(0) && !irqs_disabled()) {
 		preempt_schedule_common();
 		return 1;
 	}
@@ -9147,8 +8982,7 @@ int cpuset_cpumask_can_shrink(const struct cpumask *cur,
 	return ret;
 }
 
-int task_can_attach(struct task_struct *p,
-		    const struct cpumask *cs_effective_cpus)
+int task_can_attach(struct task_struct *p)
 {
 	int ret = 0;
 
@@ -9161,21 +8995,9 @@ int task_can_attach(struct task_struct *p,
 	 * success of set_cpus_allowed_ptr() on all attached tasks
 	 * before cpus_mask may be changed.
 	 */
-	if (p->flags & PF_NO_SETAFFINITY) {
+	if (p->flags & PF_NO_SETAFFINITY)
 		ret = -EINVAL;
-		goto out;
-	}
 
-	if (dl_task(p) && !cpumask_intersects(task_rq(p)->rd->span,
-					      cs_effective_cpus)) {
-		int cpu = cpumask_any_and(cpu_active_mask, cs_effective_cpus);
-
-		if (unlikely(cpu >= nr_cpu_ids))
-			return -EINVAL;
-		ret = dl_cpu_busy(cpu, p);
-	}
-
-out:
 	return ret;
 }
 
@@ -9350,9 +9172,11 @@ static void balance_push(struct rq *rq)
 	 * Temporarily drop rq->lock such that we can wake-up the stop task.
 	 * Both preemption and IRQs are still disabled.
 	 */
+	preempt_disable();
 	raw_spin_rq_unlock(rq);
 	stop_one_cpu_nowait(rq->cpu, __balance_push_cpu_stop, push_task,
 			    this_cpu_ptr(&push_work));
+	preempt_enable();
 	/*
 	 * At this point need_resched() is true and we'll take the loop in
 	 * schedule(). The next pick is obviously going to be the stop task
@@ -9475,7 +9299,7 @@ static void cpuset_cpu_active(void)
 static int cpuset_cpu_inactive(unsigned int cpu)
 {
 	if (!cpuhp_tasks_frozen) {
-		int ret = dl_cpu_busy(cpu, NULL);
+		int ret = dl_bw_check_overflow(cpu);
 
 		if (ret)
 			return ret;
@@ -9485,6 +9309,22 @@ static int cpuset_cpu_inactive(unsigned int cpu)
 		partition_sched_domains(1, NULL, NULL);
 	}
 	return 0;
+}
+
+static inline void sched_smt_present_inc(int cpu)
+{
+#ifdef CONFIG_SCHED_SMT
+	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
+		static_branch_inc_cpuslocked(&sched_smt_present);
+#endif
+}
+
+static inline void sched_smt_present_dec(int cpu)
+{
+#ifdef CONFIG_SCHED_SMT
+	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
+		static_branch_dec_cpuslocked(&sched_smt_present);
+#endif
 }
 
 int sched_cpu_activate(unsigned int cpu)
@@ -9498,13 +9338,10 @@ int sched_cpu_activate(unsigned int cpu)
 	 */
 	balance_push_set(cpu, false);
 
-#ifdef CONFIG_SCHED_SMT
 	/*
 	 * When going up, increment the number of cores with SMT present.
 	 */
-	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
-		static_branch_inc_cpuslocked(&sched_smt_present);
-#endif
+	sched_smt_present_inc(cpu);
 	set_cpu_active(cpu, true);
 
 	if (sched_smp_initialized) {
@@ -9573,13 +9410,12 @@ int sched_cpu_deactivate(unsigned int cpu)
 	}
 	rq_unlock_irqrestore(rq, &rf);
 
-#ifdef CONFIG_SCHED_SMT
 	/*
 	 * When going down, decrement the number of cores with SMT present.
 	 */
-	if (cpumask_weight(cpu_smt_mask(cpu)) == 2)
-		static_branch_dec_cpuslocked(&sched_smt_present);
+	sched_smt_present_dec(cpu);
 
+#ifdef CONFIG_SCHED_SMT
 	sched_core_cpu_deactivate(cpu);
 #endif
 
@@ -9588,6 +9424,7 @@ int sched_cpu_deactivate(unsigned int cpu)
 
 	ret = cpuset_cpu_inactive(cpu);
 	if (ret) {
+		sched_smt_present_inc(cpu);
 		balance_push_set(cpu, false);
 		set_cpu_active(cpu, true);
 		return ret;
@@ -10016,9 +9853,6 @@ void ___might_sleep(const char *file, int line, int preempt_offset)
 
 	dump_stack();
 	add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
-#if IS_ENABLED(CONFIG_MTK_PANIC_ON_WARN)
-	BUG();
-#endif
 }
 EXPORT_SYMBOL(___might_sleep);
 
@@ -10047,9 +9881,6 @@ void __cant_sleep(const char *file, int line, int preempt_offset)
 	debug_show_held_locks(current);
 	dump_stack();
 	add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
-#if IS_ENABLED(CONFIG_MTK_PANIC_ON_WARN)
-	BUG();
-#endif
 }
 EXPORT_SYMBOL_GPL(__cant_sleep);
 
@@ -10082,9 +9913,6 @@ void __cant_migrate(const char *file, int line)
 	debug_show_held_locks(current);
 	dump_stack();
 	add_taint(TAINT_WARN, LOCKDEP_STILL_OK);
-#if IS_ENABLED(CONFIG_MTK_PANIC_ON_WARN)
-	BUG();
-#endif
 }
 EXPORT_SYMBOL_GPL(__cant_migrate);
 #endif
@@ -10333,6 +10161,7 @@ void sched_move_task(struct task_struct *tsk)
 	struct rq_flags rf;
 	struct rq *rq;
 
+	trace_android_vh_sched_move_task(tsk);
 	rq = task_rq_lock(tsk, &rf);
 	update_rq_clock(rq);
 
@@ -10373,6 +10202,7 @@ cpu_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 	struct task_group *tg;
 
 	if (!parent) {
+		trace_android_vh_cpu_cgroup_css_alloc_early(parent);
 		/* This is early initialization for the top cgroup */
 		return &root_task_group.css;
 	}
@@ -10380,6 +10210,8 @@ cpu_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 	tg = sched_create_group(parent);
 	if (IS_ERR(tg))
 		return ERR_PTR(-ENOMEM);
+
+	trace_android_vh_cpu_cgroup_css_alloc(tg, parent_css);
 
 	return &tg->css;
 }
@@ -10421,6 +10253,8 @@ static void cpu_cgroup_css_free(struct cgroup_subsys_state *css)
 	 * Relies on the RCU grace period between css_released() and this.
 	 */
 	sched_unregister_group(tg);
+
+	trace_android_vh_cpu_cgroup_css_free(css);
 }
 
 /*
@@ -11258,7 +11092,7 @@ static ssize_t cpu_max_write(struct kernfs_open_file *of,
 {
 	struct task_group *tg = css_tg(of_css(of));
 	u64 period = tg_get_cfs_period(tg);
-	u64 burst = tg_get_cfs_burst(tg);
+	u64 burst = tg->cfs_bandwidth.burst;
 	u64 quota;
 	int ret;
 
@@ -11341,7 +11175,7 @@ struct cgroup_subsys cpu_cgrp_subsys = {
 	.early_init	= true,
 	.threaded	= true,
 };
-
+EXPORT_SYMBOL_GPL(cpu_cgrp_subsys);
 #endif	/* CONFIG_CGROUP_SCHED */
 
 void dump_cpu_task(int cpu)

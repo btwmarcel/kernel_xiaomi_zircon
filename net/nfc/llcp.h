@@ -92,6 +92,7 @@ struct nfc_llcp_local {
 	struct hlist_head pending_sdreqs;
 	struct timer_list sdreq_timer;
 	struct work_struct sdreq_timeout_work;
+	struct work_struct release_work;
 	u8 sdreq_next_tid;
 
 	/* sockets array */
@@ -202,7 +203,6 @@ void nfc_llcp_sock_link(struct llcp_sock_list *l, struct sock *s);
 void nfc_llcp_sock_unlink(struct llcp_sock_list *l, struct sock *s);
 void nfc_llcp_socket_remote_param_init(struct nfc_llcp_sock *sock);
 struct nfc_llcp_local *nfc_llcp_find_local(struct nfc_dev *dev);
-struct nfc_llcp_local *nfc_llcp_local_get(struct nfc_llcp_local *local);
 int nfc_llcp_local_put(struct nfc_llcp_local *local);
 u8 nfc_llcp_get_sdp_ssap(struct nfc_llcp_local *local,
 			 struct nfc_llcp_sock *sock);

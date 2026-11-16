@@ -15,6 +15,7 @@
 #include <linux/moduleparam.h>
 #include <linux/ioport.h>
 #include <linux/init.h>
+#include <linux/irq.h>
 #include <linux/console.h>
 #include <linux/gpio/consumer.h>
 #include <linux/sysrq.h>
@@ -36,11 +37,6 @@
 #include <asm/irq.h>
 
 #include "8250.h"
-
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-#include <linux/sched.h>
-#include <linux/sched/clock.h>
-#endif
 
 /* Nuvoton NPCM timeout register */
 #define UART_NPCM_TOR          7
@@ -674,13 +670,6 @@ int serial8250_em485_config(struct uart_port *port, struct serial_rs485 *rs485)
 		rs485->flags &= ~SER_RS485_RTS_AFTER_SEND;
 	}
 
-	/* clamp the delays to [0, 100ms] */
-	rs485->delay_rts_before_send = min(rs485->delay_rts_before_send, 100U);
-	rs485->delay_rts_after_send  = min(rs485->delay_rts_after_send, 100U);
-
-	memset(rs485->padding, 0, sizeof(rs485->padding));
-	port->rs485 = *rs485;
-
 	gpiod_set_value(port->rs485_term_gpio,
 			rs485->flags & SER_RS485_TERMINATE_BUS);
 
@@ -688,15 +677,8 @@ int serial8250_em485_config(struct uart_port *port, struct serial_rs485 *rs485)
 	 * Both serial8250_em485_init() and serial8250_em485_destroy()
 	 * are idempotent.
 	 */
-	if (rs485->flags & SER_RS485_ENABLED) {
-		int ret = serial8250_em485_init(up);
-
-		if (ret) {
-			rs485->flags &= ~SER_RS485_ENABLED;
-			port->rs485.flags &= ~SER_RS485_ENABLED;
-		}
-		return ret;
-	}
+	if (rs485->flags & SER_RS485_ENABLED)
+		return serial8250_em485_init(up);
 
 	serial8250_em485_destroy(up);
 	return 0;
@@ -1383,9 +1365,6 @@ static void autoconfig_irq(struct uart_8250_port *up)
 		inb_p(ICP);
 	}
 
-	if (uart_console(port))
-		console_lock();
-
 	/* forget possible initially masked and pending IRQ */
 	probe_irq_off(probe_irq_on());
 	save_mcr = serial8250_in_MCR(up);
@@ -1415,9 +1394,6 @@ static void autoconfig_irq(struct uart_8250_port *up)
 
 	if (port->flags & UPF_FOURPORT)
 		outb_p(save_ICP, ICP);
-
-	if (uart_console(port))
-		console_unlock();
 
 	port->irq = (irq > 0) ? irq : 0;
 }
@@ -1908,27 +1884,23 @@ int serial8250_handle_irq(struct uart_port *port, unsigned int iir)
 {
 	unsigned char status;
 	struct uart_8250_port *up = up_to_u8250p(port);
+	struct tty_port *tport = &port->state->port;
 	bool skip_rx = false;
 	unsigned long flags;
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	u64 ts[9] = {0};
-	u64 THRESHOLD = 5 * 1000 * 1000;
-#endif
 
 	if (iir & UART_IIR_NO_INT)
 		return 0;
 
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-		ts[0] = sched_clock();
-#endif
-
 	spin_lock_irqsave(&port->lock, flags);
 
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-		ts[1] = sched_clock();
-#endif
-
 	status = serial_port_in(port, UART_LSR);
+
+	/*
+	 * Recover from no-data-ready and FIFO error condition to avoid getting
+	 * stuck in the ISR.
+	 */
+	if (!(status & UART_LSR_DR) && (status & UART_LSR_FIFOE))
+		serial8250_clear_and_reinit_fifos(up);
 
 	/*
 	 * If port is stopped and there are no error conditions in the
@@ -1944,45 +1916,21 @@ int serial8250_handle_irq(struct uart_port *port, unsigned int iir)
 		skip_rx = true;
 
 	if (status & (UART_LSR_DR | UART_LSR_BI) && !skip_rx) {
-		if (!up->dma || handle_rx_dma(up, iir)) {
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-			ts[2] = sched_clock();
-#endif
+		struct irq_data *d;
+
+		d = irq_get_irq_data(port->irq);
+		if (d && irqd_is_wakeup_set(d))
+			pm_wakeup_event(tport->tty->dev, 0);
+		if (!up->dma || handle_rx_dma(up, iir))
 			status = serial8250_rx_chars(up, status);
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-			ts[3] = sched_clock();
-#endif
-			}
 	}
 	serial8250_modem_status(up);
 	if ((!up->dma || up->dma->tx_err) && (status & UART_LSR_THRE) &&
-		(up->ier & UART_IER_THRI)) {
-
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-		ts[4] = sched_clock();
-#endif
-
+		(up->ier & UART_IER_THRI))
 		serial8250_tx_chars(up);
 
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-		ts[5] = sched_clock();
-#endif
-	}
-
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[6] = sched_clock();
-#endif
 	uart_unlock_and_check_sysrq_irqrestore(port, flags);
 
-#if IS_ENABLED(CONFIG_MTK_IRQ_MONITOR_DEBUG)
-	ts[7] = sched_clock();
-
-	if ((ts[7] - ts[0]) > THRESHOLD)
-		pr_info("[%s]: ts0[%lld], 1[%lld], 2[%lld], 3[%lld], 1-0[%lld],\n"
-			"3-2[%lld], 3-0[%lld], 5-4[%lld], 7-0[%lld]\n", __func__,
-			ts[0], ts[1], ts[2], ts[3], ts[1]-ts[0], ts[3]-ts[2], ts[3]-ts[0],
-			ts[5]-ts[4], ts[7]-ts[0]);
-#endif
 	return 1;
 }
 EXPORT_SYMBOL_GPL(serial8250_handle_irq);
@@ -2029,19 +1977,25 @@ static int serial8250_tx_threshold_handle_irq(struct uart_port *port)
 static unsigned int serial8250_tx_empty(struct uart_port *port)
 {
 	struct uart_8250_port *up = up_to_u8250p(port);
+	unsigned int result = 0;
 	unsigned long flags;
 	unsigned int lsr;
 
 	serial8250_rpm_get(up);
 
 	spin_lock_irqsave(&port->lock, flags);
-	lsr = serial_port_in(port, UART_LSR);
-	up->lsr_saved_flags |= lsr & LSR_SAVE_FLAGS;
+	if (!serial8250_tx_dma_running(up)) {
+		lsr = serial_port_in(port, UART_LSR);
+		up->lsr_saved_flags |= lsr & LSR_SAVE_FLAGS;
+
+		if ((lsr & BOTH_EMPTY) == BOTH_EMPTY)
+			result = TIOCSER_TEMT;
+	}
 	spin_unlock_irqrestore(&port->lock, flags);
 
 	serial8250_rpm_put(up);
 
-	return (lsr & BOTH_EMPTY) == BOTH_EMPTY ? TIOCSER_TEMT : 0;
+	return result;
 }
 
 unsigned int serial8250_do_get_mctrl(struct uart_port *port)
@@ -2382,9 +2336,8 @@ int serial8250_do_startup(struct uart_port *port)
 	/*
 	 * Now, initialize the UART
 	 */
-	serial_port_out(port, UART_LCR, UART_LCR_WLEN8);
-
 	spin_lock_irqsave(&port->lock, flags);
+	serial_port_out(port, UART_LCR, UART_LCR_WLEN8);
 	if (up->port.flags & UPF_FOURPORT) {
 		if (!up->port.irq)
 			up->port.mctrl |= TIOCM_OUT1;
@@ -2539,6 +2492,12 @@ void serial8250_do_shutdown(struct uart_port *port)
 	 * the IRQ chain.
 	 */
 	serial_port_in(port, UART_RX);
+	/*
+	 * LCR writes on DW UART can trigger late (unmaskable) IRQs.
+	 * Handle them before releasing the handler.
+	 */
+	synchronize_irq(port->irq);
+
 	serial8250_rpm_put(up);
 
 	up->ops->release_irq(up);
@@ -2560,6 +2519,14 @@ static unsigned int npcm_get_divisor(struct uart_8250_port *up,
 	struct uart_port *port = &up->port;
 
 	return DIV_ROUND_CLOSEST(port->uartclk, 16 * baud + 2) - 2;
+}
+
+static void serial8250_flush_buffer(struct uart_port *port)
+{
+	struct uart_8250_port *up = up_to_u8250p(port);
+
+	if (up->dma)
+		serial8250_tx_dma_flush(up);
 }
 
 static unsigned int serial8250_do_get_divisor(struct uart_port *port,
@@ -3293,6 +3260,7 @@ static const struct uart_ops serial8250_pops = {
 	.break_ctl	= serial8250_break_ctl,
 	.startup	= serial8250_startup,
 	.shutdown	= serial8250_shutdown,
+	.flush_buffer	= serial8250_flush_buffer,
 	.set_termios	= serial8250_set_termios,
 	.set_ldisc	= serial8250_set_ldisc,
 	.pm		= serial8250_pm,
@@ -3312,6 +3280,7 @@ void serial8250_init_port(struct uart_8250_port *up)
 	struct uart_port *port = &up->port;
 
 	spin_lock_init(&port->lock);
+	port->pm = NULL;
 	port->ops = &serial8250_pops;
 	port->has_sysrq = IS_ENABLED(CONFIG_SERIAL_8250_CONSOLE);
 

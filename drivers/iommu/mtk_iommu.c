@@ -1634,7 +1634,7 @@ static int mtk_iommu_set_dev_dma(struct device *dev)
 static int mtk_iommu_attach_device(struct iommu_domain *domain,
 				   struct device *dev)
 {
-	struct mtk_iommu_data *data = dev_iommu_priv_get(dev);
+	struct mtk_iommu_data *data = dev_iommu_priv_get(dev), *frstdata;
 	struct mtk_iommu_domain *dom = to_mtk_domain(domain);
 	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(dev);
 	struct device *m4udev;
@@ -1665,6 +1665,7 @@ static int mtk_iommu_attach_device(struct iommu_domain *domain,
 			data->plat_data->iommu_id, dom->tab_id);
 	}
 
+	mutex_lock(&data->mutex);
 	if (!data->m4u_dom) { /* Initialize the M4U HW */
 		ret = pm_runtime_resume_and_get(m4udev);
 		if (ret < 0) {
@@ -1703,6 +1704,7 @@ static int mtk_iommu_attach_device(struct iommu_domain *domain,
 #endif
 		pm_runtime_put(m4udev);
 	}
+	mutex_unlock(&data->mutex);
 
 	mtk_iommu_config(data, dev, true, domid);
 	mtk_iommu_set_dev_dma(dev);
@@ -1902,7 +1904,6 @@ static struct iommu_device *mtk_iommu_probe_device(struct device *dev)
 			return ERR_PTR(-EINVAL);
 		}
 	}
-
 	return &data->iommu;
 }
 
@@ -1975,6 +1976,8 @@ static int mtk_iommu_of_xlate(struct device *dev, struct of_phandle_args *args)
 			return -EINVAL;
 
 		dev_iommu_priv_set(dev, platform_get_drvdata(m4updev));
+
+		put_device(&m4updev->dev);
 	}
 
 	return iommu_fwspec_add_ids(dev, args->args, 1);
@@ -2854,6 +2857,7 @@ skip_smi:
 	}
 
 	platform_set_drvdata(pdev, data);
+	mutex_init(&data->mutex);
 
 	ret = iommu_device_sysfs_add(&data->iommu, dev, NULL,
 				     "mtk-iommu.%pa", &ioaddr);
@@ -3765,6 +3769,7 @@ static const struct of_device_id mtk_iommu_of_ids[] = {
 	{ .compatible = "mediatek,mt8192-m4u", .data = &mt8192_data},
 	{}
 };
+MODULE_DEVICE_TABLE(of, mtk_iommu_of_ids);
 
 static struct platform_driver mtk_iommu_driver = {
 	.probe	= mtk_iommu_probe,
