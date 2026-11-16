@@ -12,7 +12,7 @@
 #if IS_ENABLED(CONFIG_RPMB)
 int mmc_rpmb_register(struct mmc_host *mmc);
 #else
-int mmc_rpmb_register(...);
+static inline int mmc_rpmb_register(void *mmc) { return 0; }
 #endif
 
 #endif
