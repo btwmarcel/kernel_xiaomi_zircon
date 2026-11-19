@@ -268,7 +268,7 @@ static void mtk_vdec_hw_break_vld_top_dump(
 	}
 }
 
-static void mtk_vdec_hw_break(struct mtk_vcodec_dev *dev, int hw_id)
+static void __maybe_unused mtk_vdec_hw_break(struct mtk_vcodec_dev *dev, int hw_id)
 {
 	u32 cg_status = 0, ufo_cg_status = 0;
 	void __iomem *vdec_misc_addr = dev->dec_reg_base[VDEC_MISC];
@@ -603,7 +603,7 @@ void mtk_vcodec_dec_clock_off(struct mtk_vcodec_pm *pm, int hw_id)
 		mutex_unlock(&pm->dec_racing_info_mutex);
 	}
 
-	mtk_vdec_hw_break(dev, hw_id);
+	//mtk_vdec_hw_break(dev, hw_id);
 
 	/* avoid translation fault callback dump reg not done */
 	spin_lock_irqsave(&dev->dec_power_lock[hw_id], flags);
